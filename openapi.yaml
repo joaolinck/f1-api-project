@@ -1,0 +1,1315 @@
+openapi: 3.0.3
+
+info:
+  title: F1 Hub API
+  version: 1.0.0
+  description: |
+    Plataforma de integracao para consulta de dados da Formula 1.
+
+    O backend atua como consumidor da API publica Jolpica F1 e como BFF:
+    ele extrai, mapeia e formata os dados externos conforme os schemas deste contrato.
+
+    **Autenticacao:** todas as rotas, exceto `POST /usuarios` (cadastro) e `POST /auth/login`,
+    exigem JWT no header `Authorization: Bearer <token>`. O token expira (ver `expira_em` no login):
+    token ausente, invalido ou expirado resulta em 401 e o cliente deve autenticar de novo.
+    Esta versao nao possui refresh token.
+
+    **Papeis (RBAC):** `usuario` e `admin`. Todo cadastro publico cria um usuario com papel
+    `usuario`. O papel `admin` nao pode ser escolhido no cadastro e existe apenas em contas
+    criadas diretamente pela equipe. Rotas marcadas como "somente admin" devolvem 403
+    para o papel `usuario`.
+
+    **Erros:** toda resposta de erro segue o schema `Erro` (chave `mensagem_erro`).
+
+    **Limite de requisicoes:** as rotas publicas `POST /usuarios` e `POST /auth/login` limitam
+    tentativas por IP e respondem 429 com o header `Retry-After` (segundos). Quando o provedor
+    externo limita a taxa de chamadas, a API responde 503 (`EXTERNAL_UNAVAILABLE`).
+
+    **Dados vazios:** temporada sem dados, piloto inexistente ou corrida sem resultado resultam
+    em 404. Filtro sem resultado ou pagina alem do total resultam em 200 com `dados` vazio.
+
+    **Rastreabilidade:** toda resposta inclui o header `X-Correlation-Id`. Se o cliente enviar
+    esse header, o mesmo valor e propagado; caso contrario, o backend gera um.
+
+servers:
+  - url: http://localhost:3000
+    description: Desenvolvimento local
+
+tags:
+  - name: Usuarios
+    description: Cadastro de novos usuarios
+  - name: Autenticacao
+    description: Login e emissao de token JWT
+  - name: Pilotos
+    description: Consulta de pilotos (com paginacao e filtro)
+  - name: Equipes
+    description: Consulta de equipes (construtores)
+  - name: Corridas
+    description: Calendario e resultados de corridas
+  - name: Classificacoes
+    description: Classificacao de pilotos e de equipes
+  - name: Favoritos
+    description: Pilotos favoritos do usuario autenticado
+  - name: Administracao
+    description: Operacoes restritas ao papel admin
+
+security:
+  - bearerAuth: []
+
+paths:
+  /usuarios:
+    parameters:
+      - $ref: '#/components/parameters/XCorrelationIdHeader'
+    post:
+      tags: [Usuarios]
+      summary: Cadastra um novo usuario
+      description: |
+        Rota publica. O usuario criado sempre recebe o papel `usuario`.
+        O corpo nao aceita o campo `papel`: se for enviado, a requisicao e rejeitada com 400,
+        impedindo que alguem se cadastre como admin. Apos o cadastro, o cliente deve chamar
+        `POST /auth/login` para obter o token.
+        Limitado por IP: excesso de tentativas resulta em 429.
+      operationId: cadastrarUsuario
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UsuarioCriacao'
+      responses:
+        '201':
+          description: Usuario cadastrado com sucesso
+          headers:
+            X-Correlation-Id:
+              $ref: '#/components/headers/XCorrelationId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Usuario'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /usuarios/me:
+    parameters:
+      - $ref: '#/components/parameters/XCorrelationIdHeader'
+    get:
+      tags: [Usuarios]
+      summary: Retorna os dados do usuario autenticado
+      description: |
+        Permite ao cliente restaurar a sessao (nome e papel) a partir do token guardado,
+        sem depender do conteudo interno do JWT.
+      operationId: obterUsuarioAtual
+      responses:
+        '200':
+          description: Dados do usuario autenticado
+          headers:
+            X-Correlation-Id:
+              $ref: '#/components/headers/XCorrelationId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Usuario'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /auth/login:
+    parameters:
+      - $ref: '#/components/parameters/XCorrelationIdHeader'
+    post:
+      tags: [Autenticacao]
+      summary: Autentica o usuario e retorna um token JWT
+      description: |
+        Devolve o mesmo 401 para email inexistente e senha incorreta, sem revelar qual dos dois
+        falhou. O email nao diferencia maiusculas de minusculas. Limitado por IP: excesso de
+        tentativas resulta em 429.
+      operationId: login
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/LoginRequest'
+      responses:
+        '200':
+          description: Login realizado com sucesso
+          headers:
+            X-Correlation-Id:
+              $ref: '#/components/headers/XCorrelationId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LoginResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /pilotos:
+    parameters:
+      - $ref: '#/components/parameters/XCorrelationIdHeader'
+    get:
+      tags: [Pilotos]
+      summary: Lista pilotos de uma temporada, com filtro e paginacao
+      description: |
+        O backend obtem a lista da temporada na API externa e aplica o filtro por
+        nacionalidade e a paginacao antes de responder.
+
+        - Filtro sem resultado, ou `pagina` alem do total: 200 com `dados` vazio.
+        - Temporada sem dados: 404.
+      operationId: listarPilotos
+      parameters:
+        - $ref: '#/components/parameters/Temporada'
+        - name: nacionalidade
+          in: query
+          required: false
+          description: Filtra pela nacionalidade do piloto (ex. Brazilian, British). Sem diferenciar maiusculas.
+          schema:
+            type: string
+            minLength: 2
+            maxLength: 50
+            example: British
+        - $ref: '#/components/parameters/Pagina'
+        - $ref: '#/components/parameters/Limite'
+      responses:
+        '200':
+          description: Lista paginada de pilotos
+          headers:
+            X-Correlation-Id:
+              $ref: '#/components/headers/XCorrelationId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ListaPilotos'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '502':
+          $ref: '#/components/responses/BadGateway'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+        '504':
+          $ref: '#/components/responses/GatewayTimeout'
+
+  /pilotos/{id}:
+    parameters:
+      - $ref: '#/components/parameters/XCorrelationIdHeader'
+    get:
+      tags: [Pilotos]
+      summary: Retorna o perfil consolidado de um piloto
+      description: |
+        Composicao (BFF): combina, em uma unica resposta, os dados cadastrais do piloto,
+        a posicao atual na classificacao e os ultimos resultados na temporada.
+
+        Retorna 404 quando o piloto nao existe ou nao participou da temporada informada.
+        O provedor externo responde 200 com lista vazia nesses casos, e o backend converte
+        essa lista vazia em 404.
+      operationId: obterPerfilPiloto
+      parameters:
+        - $ref: '#/components/parameters/PilotoId'
+        - $ref: '#/components/parameters/Temporada'
+      responses:
+        '200':
+          description: Perfil consolidado do piloto
+          headers:
+            X-Correlation-Id:
+              $ref: '#/components/headers/XCorrelationId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PerfilPiloto'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '502':
+          $ref: '#/components/responses/BadGateway'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+        '504':
+          $ref: '#/components/responses/GatewayTimeout'
+
+  /equipes:
+    parameters:
+      - $ref: '#/components/parameters/XCorrelationIdHeader'
+    get:
+      tags: [Equipes]
+      summary: Lista as equipes de uma temporada
+      description: Temporada sem dados retorna 404.
+      operationId: listarEquipes
+      parameters:
+        - $ref: '#/components/parameters/Temporada'
+      responses:
+        '200':
+          description: Lista de equipes
+          headers:
+            X-Correlation-Id:
+              $ref: '#/components/headers/XCorrelationId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ListaEquipes'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '502':
+          $ref: '#/components/responses/BadGateway'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+        '504':
+          $ref: '#/components/responses/GatewayTimeout'
+
+  /corridas:
+    parameters:
+      - $ref: '#/components/parameters/XCorrelationIdHeader'
+    get:
+      tags: [Corridas]
+      summary: Lista o calendario de corridas de uma temporada
+      description: Temporada sem dados retorna 404.
+      operationId: listarCorridas
+      parameters:
+        - $ref: '#/components/parameters/Temporada'
+      responses:
+        '200':
+          description: Calendario da temporada
+          headers:
+            X-Correlation-Id:
+              $ref: '#/components/headers/XCorrelationId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ListaCorridas'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '502':
+          $ref: '#/components/responses/BadGateway'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+        '504':
+          $ref: '#/components/responses/GatewayTimeout'
+
+  /corridas/{temporada}/{rodada}/resultados:
+    parameters:
+      - $ref: '#/components/parameters/XCorrelationIdHeader'
+    get:
+      tags: [Corridas]
+      summary: Retorna o resultado de uma corrida
+      description: |
+        Retorna 404 quando a rodada nao existe na temporada ou ainda nao possui resultado
+        (corrida futura). O provedor externo responde 200 com lista vazia nesses casos.
+      operationId: obterResultadosCorrida
+      parameters:
+        - name: temporada
+          in: path
+          required: true
+          description: Ano da temporada
+          schema:
+            type: integer
+            minimum: 1950
+            maximum: 2100
+            example: 2024
+        - name: rodada
+          in: path
+          required: true
+          description: Numero da rodada dentro da temporada
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 30
+            example: 1
+      responses:
+        '200':
+          description: Resultado completo da corrida
+          headers:
+            X-Correlation-Id:
+              $ref: '#/components/headers/XCorrelationId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ResultadosCorrida'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '502':
+          $ref: '#/components/responses/BadGateway'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+        '504':
+          $ref: '#/components/responses/GatewayTimeout'
+
+  /classificacoes-pilotos:
+    parameters:
+      - $ref: '#/components/parameters/XCorrelationIdHeader'
+    get:
+      tags: [Classificacoes]
+      summary: Retorna a classificacao de pilotos de uma temporada
+      description: Temporada sem dados retorna 404.
+      operationId: listarClassificacaoPilotos
+      parameters:
+        - $ref: '#/components/parameters/Temporada'
+      responses:
+        '200':
+          description: Classificacao de pilotos
+          headers:
+            X-Correlation-Id:
+              $ref: '#/components/headers/XCorrelationId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ClassificacaoPilotos'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '502':
+          $ref: '#/components/responses/BadGateway'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+        '504':
+          $ref: '#/components/responses/GatewayTimeout'
+
+  /classificacoes-equipes:
+    parameters:
+      - $ref: '#/components/parameters/XCorrelationIdHeader'
+    get:
+      tags: [Classificacoes]
+      summary: Retorna a classificacao de equipes de uma temporada
+      description: Temporada sem dados retorna 404.
+      operationId: listarClassificacaoEquipes
+      parameters:
+        - $ref: '#/components/parameters/Temporada'
+      responses:
+        '200':
+          description: Classificacao de equipes
+          headers:
+            X-Correlation-Id:
+              $ref: '#/components/headers/XCorrelationId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ClassificacaoEquipes'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '502':
+          $ref: '#/components/responses/BadGateway'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+        '504':
+          $ref: '#/components/responses/GatewayTimeout'
+
+  /favoritos:
+    parameters:
+      - $ref: '#/components/parameters/XCorrelationIdHeader'
+    get:
+      tags: [Favoritos]
+      summary: Lista os pilotos favoritos do usuario autenticado
+      operationId: listarFavoritos
+      responses:
+        '200':
+          description: Lista de favoritos
+          headers:
+            X-Correlation-Id:
+              $ref: '#/components/headers/XCorrelationId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ListaFavoritos'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '500':
+          $ref: '#/components/responses/InternalError'
+    post:
+      tags: [Favoritos]
+      summary: Adiciona um piloto aos favoritos
+      description: |
+        Rota sensivel a duplicidade, por isso exige o header `Idempotency-Key`.
+
+        - Primeira requisicao com uma chave: cria o favorito e responde **201**.
+        - Repeticao da mesma chave com o mesmo corpo: nao cria de novo e responde **200**
+          com o favorito ja criado.
+        - Mesma chave com corpo diferente, ou piloto ja favoritado com outra chave: **409**.
+
+        O backend valida se o piloto existe consultando a API externa.
+      operationId: adicionarFavorito
+      parameters:
+        - name: Idempotency-Key
+          in: header
+          required: true
+          description: Chave unica gerada pelo cliente (ex. UUID) para esta operacao
+          schema:
+            type: string
+            minLength: 8
+            maxLength: 128
+            example: 3f1c9a52-7d3e-4b8a-9c11-0a5e6d2b7f40
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/FavoritoCriacao'
+      responses:
+        '201':
+          description: Favorito criado
+          headers:
+            X-Correlation-Id:
+              $ref: '#/components/headers/XCorrelationId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Favorito'
+        '200':
+          description: Chave de idempotencia ja processada, retorna o favorito original
+          headers:
+            X-Correlation-Id:
+              $ref: '#/components/headers/XCorrelationId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Favorito'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '502':
+          $ref: '#/components/responses/BadGateway'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+        '504':
+          $ref: '#/components/responses/GatewayTimeout'
+
+  /favoritos/{id}:
+    parameters:
+      - $ref: '#/components/parameters/XCorrelationIdHeader'
+    delete:
+      tags: [Favoritos]
+      summary: Remove um piloto dos favoritos
+      description: |
+        Remove apenas favoritos do proprio usuario autenticado. Um favorito que pertence a outro
+        usuario responde 404, sem revelar que ele existe.
+      operationId: removerFavorito
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: Identificador do favorito
+          schema:
+            type: integer
+            minimum: 1
+            example: 7
+      responses:
+        '204':
+          description: Favorito removido
+          headers:
+            X-Correlation-Id:
+              $ref: '#/components/headers/XCorrelationId'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /cache:
+    parameters:
+      - $ref: '#/components/parameters/XCorrelationIdHeader'
+    delete:
+      tags: [Administracao]
+      summary: Limpa o cache das consultas a API externa (somente admin)
+      description: Restrito ao papel `admin` (RBAC). Usuarios com papel `usuario` recebem 403.
+      operationId: limparCache
+      x-required-role: admin
+      responses:
+        '200':
+          description: Cache limpo
+          headers:
+            X-Correlation-Id:
+              $ref: '#/components/headers/XCorrelationId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CacheLimpo'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+
+  headers:
+    XCorrelationId:
+      description: Identificador de rastreio da operacao, presente em todos os logs
+      schema:
+        type: string
+        example: c1f2a9d4-58b3-4e0a-9f6e-2d7b1a3c4e55
+
+    RetryAfter:
+      description: Segundos que o cliente deve aguardar antes de tentar novamente
+      schema:
+        type: integer
+        minimum: 0
+        example: 30
+
+  parameters:
+    Temporada:
+      name: temporada
+      in: query
+      required: false
+      description: |
+        Ano da temporada (1950 a 2099, ex. 2024) ou `current` para a temporada atual.
+        A resposta traz sempre o ano ja resolvido, como numero, no campo `temporada`.
+      schema:
+        type: string
+        pattern: '^(current|19[5-9][0-9]|20[0-9]{2})$'
+        default: current
+        example: '2024'
+    XCorrelationIdHeader:
+      name: X-Correlation-Id
+      in: header
+      required: false
+      description: |
+        Identificador de rastreio opcional. Se enviado, o mesmo valor e usado nos logs e devolvido
+        na resposta; se ausente, o backend gera um. Aceita letras, numeros, ponto, underline e hifen.
+      schema:
+        type: string
+        pattern: '^[A-Za-z0-9._-]{1,128}$'
+        example: c1f2a9d4-58b3-4e0a-9f6e-2d7b1a3c4e55
+    Pagina:
+      name: pagina
+      in: query
+      required: false
+      description: Numero da pagina, iniciando em 1
+      schema:
+        type: integer
+        minimum: 1
+        default: 1
+    Limite:
+      name: limite
+      in: query
+      required: false
+      description: Quantidade de itens por pagina
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 100
+        default: 10
+    PilotoId:
+      name: id
+      in: path
+      required: true
+      description: Identificador do piloto na API externa (ex. max_verstappen)
+      schema:
+        type: string
+        pattern: '^[a-z0-9_]+$'
+        minLength: 2
+        maxLength: 60
+        example: max_verstappen
+
+  responses:
+    BadRequest:
+      description: Requisicao invalida (parametro, corpo ou header fora do contrato)
+      headers:
+        X-Correlation-Id:
+          $ref: '#/components/headers/XCorrelationId'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Erro'
+          example:
+            mensagem_erro: Parametro invalido
+            codigo: VALIDATION_ERROR
+            correlation_id: c1f2a9d4-58b3-4e0a-9f6e-2d7b1a3c4e55
+            detalhes:
+              - campo: limite
+                problema: deve ser menor ou igual a 100
+    Unauthorized:
+      description: Token ausente, invalido ou expirado, ou credenciais incorretas no login (mensagem generica, sem revelar se o email existe)
+      headers:
+        X-Correlation-Id:
+          $ref: '#/components/headers/XCorrelationId'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Erro'
+          example:
+            mensagem_erro: Token ausente ou invalido
+            codigo: UNAUTHORIZED
+            correlation_id: c1f2a9d4-58b3-4e0a-9f6e-2d7b1a3c4e55
+    Forbidden:
+      description: Usuario autenticado, mas sem o papel necessario para esta rota
+      headers:
+        X-Correlation-Id:
+          $ref: '#/components/headers/XCorrelationId'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Erro'
+          example:
+            mensagem_erro: Acesso restrito ao papel admin
+            codigo: FORBIDDEN
+            correlation_id: c1f2a9d4-58b3-4e0a-9f6e-2d7b1a3c4e55
+    NotFound:
+      description: Recurso nao encontrado (piloto, corrida, favorito ou temporada sem dados)
+      headers:
+        X-Correlation-Id:
+          $ref: '#/components/headers/XCorrelationId'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Erro'
+          example:
+            mensagem_erro: Piloto nao encontrado
+            codigo: NOT_FOUND
+            correlation_id: c1f2a9d4-58b3-4e0a-9f6e-2d7b1a3c4e55
+    Conflict:
+      description: Conflito (email ja cadastrado, chave de idempotencia reutilizada com corpo diferente, ou favorito ja existente)
+      headers:
+        X-Correlation-Id:
+          $ref: '#/components/headers/XCorrelationId'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Erro'
+          example:
+            mensagem_erro: Piloto ja esta nos favoritos
+            codigo: CONFLICT
+            correlation_id: c1f2a9d4-58b3-4e0a-9f6e-2d7b1a3c4e55
+    TooManyRequests:
+      description: Muitas requisicoes em pouco tempo. Aguarde o tempo indicado em Retry-After
+      headers:
+        X-Correlation-Id:
+          $ref: '#/components/headers/XCorrelationId'
+        Retry-After:
+          $ref: '#/components/headers/RetryAfter'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Erro'
+          example:
+            mensagem_erro: Muitas tentativas, tente novamente em instantes
+            codigo: TOO_MANY_REQUESTS
+            correlation_id: c1f2a9d4-58b3-4e0a-9f6e-2d7b1a3c4e55
+    InternalError:
+      description: Erro interno inesperado
+      headers:
+        X-Correlation-Id:
+          $ref: '#/components/headers/XCorrelationId'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Erro'
+          example:
+            mensagem_erro: Erro interno do servidor
+            codigo: INTERNAL_ERROR
+            correlation_id: c1f2a9d4-58b3-4e0a-9f6e-2d7b1a3c4e55
+    BadGateway:
+      description: A API externa respondeu com erro 5xx ou resposta invalida, mesmo apos as novas tentativas
+      headers:
+        X-Correlation-Id:
+          $ref: '#/components/headers/XCorrelationId'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Erro'
+          example:
+            mensagem_erro: Falha ao consultar o servico externo de Formula 1
+            codigo: EXTERNAL_BAD_GATEWAY
+            correlation_id: c1f2a9d4-58b3-4e0a-9f6e-2d7b1a3c4e55
+    ServiceUnavailable:
+      description: Circuit Breaker aberto ou provedor externo limitando a taxa de chamadas (429). Novas chamadas ao servico externo estao temporariamente bloqueadas
+      headers:
+        X-Correlation-Id:
+          $ref: '#/components/headers/XCorrelationId'
+        Retry-After:
+          $ref: '#/components/headers/RetryAfter'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Erro'
+          example:
+            mensagem_erro: Servico externo temporariamente indisponivel, tente novamente em instantes
+            codigo: EXTERNAL_UNAVAILABLE
+            correlation_id: c1f2a9d4-58b3-4e0a-9f6e-2d7b1a3c4e55
+    GatewayTimeout:
+      description: A API externa nao respondeu no tempo limite, mesmo apos as novas tentativas
+      headers:
+        X-Correlation-Id:
+          $ref: '#/components/headers/XCorrelationId'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Erro'
+          example:
+            mensagem_erro: Tempo limite excedido ao consultar o servico externo
+            codigo: EXTERNAL_TIMEOUT
+            correlation_id: c1f2a9d4-58b3-4e0a-9f6e-2d7b1a3c4e55
+
+  schemas:
+    Erro:
+      type: object
+      description: Formato padrao de erro, usado em todas as respostas de falha da API
+      required: [mensagem_erro, codigo, correlation_id]
+      properties:
+        mensagem_erro:
+          type: string
+          description: Mensagem legivel descrevendo o erro
+        codigo:
+          type: string
+          description: Codigo estavel para tratamento no cliente
+          enum:
+            - VALIDATION_ERROR
+            - UNAUTHORIZED
+            - FORBIDDEN
+            - NOT_FOUND
+            - CONFLICT
+            - INTERNAL_ERROR
+            - EXTERNAL_BAD_GATEWAY
+            - EXTERNAL_UNAVAILABLE
+            - EXTERNAL_TIMEOUT
+            - TOO_MANY_REQUESTS
+        correlation_id:
+          type: string
+          description: Mesmo valor do header X-Correlation-Id da resposta
+        detalhes:
+          type: array
+          description: Detalhes por campo, presente apenas em erros de validacao
+          items:
+            type: object
+            required: [campo, problema]
+            properties:
+              campo:
+                type: string
+              problema:
+                type: string
+
+    UsuarioCriacao:
+      type: object
+      description: Dados para cadastro. Nao aceita `papel` (todo cadastro publico vira `usuario`).
+      required: [nome, email, senha]
+      additionalProperties: false
+      properties:
+        nome:
+          type: string
+          minLength: 2
+          maxLength: 100
+          example: Murilo Neves
+        email:
+          type: string
+          format: email
+          maxLength: 150
+          description: Nao diferencia maiusculas de minusculas e e guardado em minusculas
+          example: murilo@email.com
+        senha:
+          type: string
+          format: password
+          minLength: 8
+          maxLength: 100
+          example: senhaSegura123
+
+    LoginRequest:
+      type: object
+      required: [email, senha]
+      properties:
+        email:
+          type: string
+          format: email
+          description: Nao diferencia maiusculas de minusculas
+          example: admin@f1hub.com
+        senha:
+          type: string
+          minLength: 6
+          maxLength: 100
+          format: password
+          example: senha123
+
+    LoginResponse:
+      type: object
+      required: [token, tipo, expira_em, usuario]
+      properties:
+        token:
+          type: string
+          description: Token JWT a ser enviado no header Authorization
+        tipo:
+          type: string
+          enum: [Bearer]
+        expira_em:
+          type: integer
+          description: Validade do token, em segundos
+          example: 3600
+        usuario:
+          $ref: '#/components/schemas/Usuario'
+
+    Usuario:
+      type: object
+      required: [id, nome, email, papel]
+      properties:
+        id:
+          type: integer
+          example: 1
+        nome:
+          type: string
+          example: Administrador
+        email:
+          type: string
+          format: email
+        papel:
+          type: string
+          enum: [usuario, admin]
+
+    Paginacao:
+      type: object
+      required: [pagina, limite, total, total_paginas]
+      properties:
+        pagina:
+          type: integer
+          example: 1
+        limite:
+          type: integer
+          example: 10
+        total:
+          type: integer
+          description: Total de itens depois de aplicar os filtros
+          example: 24
+        total_paginas:
+          type: integer
+          example: 3
+
+    Piloto:
+      type: object
+      required: [id, nome, sobrenome, nome_completo, nacionalidade]
+      properties:
+        id:
+          type: string
+          example: max_verstappen
+        numero:
+          type: integer
+          nullable: true
+          description: Numero permanente do piloto, quando existir
+          example: 3
+        codigo:
+          type: string
+          nullable: true
+          description: Codigo de tres letras, quando existir
+          example: VER
+        nome:
+          type: string
+          example: Max
+        sobrenome:
+          type: string
+          example: Verstappen
+        nome_completo:
+          type: string
+          example: Max Verstappen
+        data_nascimento:
+          type: string
+          format: date
+          nullable: true
+          example: '1997-09-30'
+        nacionalidade:
+          type: string
+          example: Dutch
+        url:
+          type: string
+          format: uri
+          nullable: true
+          description: Pagina de referencia sobre o piloto
+
+    PilotoResumo:
+      type: object
+      required: [id, nome_completo]
+      properties:
+        id:
+          type: string
+          example: norris
+        codigo:
+          type: string
+          nullable: true
+          example: NOR
+        nome_completo:
+          type: string
+          example: Lando Norris
+
+    Equipe:
+      type: object
+      required: [id, nome, nacionalidade]
+      properties:
+        id:
+          type: string
+          example: red_bull
+        nome:
+          type: string
+          example: Red Bull
+        nacionalidade:
+          type: string
+          example: Austrian
+        url:
+          type: string
+          format: uri
+          nullable: true
+
+    EquipeResumo:
+      type: object
+      required: [id, nome]
+      properties:
+        id:
+          type: string
+          example: mclaren
+        nome:
+          type: string
+          example: McLaren
+
+    Circuito:
+      type: object
+      required: [id, nome, localidade, pais]
+      properties:
+        id:
+          type: string
+          example: albert_park
+        nome:
+          type: string
+          example: Albert Park Grand Prix Circuit
+        localidade:
+          type: string
+          example: Melbourne
+        pais:
+          type: string
+          example: Australia
+
+    Corrida:
+      type: object
+      required: [temporada, rodada, nome, data, circuito]
+      properties:
+        temporada:
+          type: integer
+          example: 2024
+        rodada:
+          type: integer
+          example: 1
+        nome:
+          type: string
+          example: Bahrain Grand Prix
+        data:
+          type: string
+          format: date
+          example: '2024-03-02'
+        horario:
+          type: string
+          nullable: true
+          description: Horario de largada em UTC, quando disponivel
+          example: '15:00:00Z'
+        circuito:
+          $ref: '#/components/schemas/Circuito'
+
+    ResultadoPiloto:
+      type: object
+      required: [posicao_texto, grid, voltas, pontos, status, piloto, equipe]
+      properties:
+        posicao:
+          type: integer
+          nullable: true
+          description: Posicao final. Nulo quando o piloto nao foi classificado (ex. abandono)
+          example: 1
+        posicao_texto:
+          type: string
+          description: Posicao como texto (ex. 1, R para abandono, D para desclassificado)
+          example: '1'
+        grid:
+          type: integer
+          description: Posicao de largada (0 = largada dos boxes)
+          example: 1
+        voltas:
+          type: integer
+          example: 57
+        pontos:
+          type: number
+          example: 25
+        status:
+          type: string
+          example: Finished
+        tempo:
+          type: string
+          nullable: true
+          description: Tempo total da prova para o vencedor e diferenca para o vencedor (ex. +22.457) para os demais. Nulo quando o piloto nao terminou.
+          example: '+22.457'
+        melhor_volta:
+          type: string
+          nullable: true
+          example: '1:34.570'
+        piloto:
+          $ref: '#/components/schemas/PilotoResumo'
+        equipe:
+          $ref: '#/components/schemas/EquipeResumo'
+
+    ResultadosCorrida:
+      type: object
+      required: [corrida, resultados]
+      properties:
+        corrida:
+          $ref: '#/components/schemas/Corrida'
+        resultados:
+          type: array
+          items:
+            $ref: '#/components/schemas/ResultadoPiloto'
+
+    ClassificacaoPiloto:
+      type: object
+      required: [posicao, pontos, vitorias, piloto, equipe]
+      properties:
+        posicao:
+          type: integer
+          example: 1
+        pontos:
+          type: number
+          example: 437
+        vitorias:
+          type: integer
+          example: 9
+        piloto:
+          $ref: '#/components/schemas/PilotoResumo'
+        equipe:
+          $ref: '#/components/schemas/EquipeResumo'
+
+    ClassificacaoEquipe:
+      type: object
+      required: [posicao, pontos, vitorias, equipe]
+      properties:
+        posicao:
+          type: integer
+          example: 1
+        pontos:
+          type: number
+          example: 666
+        vitorias:
+          type: integer
+          example: 6
+        equipe:
+          $ref: '#/components/schemas/EquipeResumo'
+
+    ClassificacaoPilotos:
+      type: object
+      required: [temporada, rodada, dados]
+      properties:
+        temporada:
+          type: integer
+          example: 2024
+        rodada:
+          type: integer
+          description: Ultima rodada considerada na classificacao
+          example: 24
+        dados:
+          type: array
+          items:
+            $ref: '#/components/schemas/ClassificacaoPiloto'
+
+    ClassificacaoEquipes:
+      type: object
+      required: [temporada, rodada, dados]
+      properties:
+        temporada:
+          type: integer
+          example: 2024
+        rodada:
+          type: integer
+          example: 24
+        dados:
+          type: array
+          items:
+            $ref: '#/components/schemas/ClassificacaoEquipe'
+
+    ListaPilotos:
+      type: object
+      required: [dados, paginacao]
+      properties:
+        dados:
+          type: array
+          items:
+            $ref: '#/components/schemas/Piloto'
+        paginacao:
+          $ref: '#/components/schemas/Paginacao'
+
+    ListaEquipes:
+      type: object
+      required: [temporada, dados]
+      properties:
+        temporada:
+          type: integer
+          example: 2024
+        dados:
+          type: array
+          items:
+            $ref: '#/components/schemas/Equipe'
+
+    ListaCorridas:
+      type: object
+      required: [temporada, dados]
+      properties:
+        temporada:
+          type: integer
+          example: 2024
+        dados:
+          type: array
+          items:
+            $ref: '#/components/schemas/Corrida'
+
+    PerfilPiloto:
+      type: object
+      description: Perfil consolidado, montado pelo backend a partir de varias chamadas externas
+      required: [piloto, temporada, ultimos_resultados]
+      properties:
+        piloto:
+          $ref: '#/components/schemas/Piloto'
+        temporada:
+          type: integer
+          example: 2024
+        classificacao_atual:
+          type: object
+          nullable: true
+          description: Nulo quando o piloto nao aparece na classificacao da temporada
+          required: [posicao, pontos, vitorias, equipe]
+          properties:
+            posicao:
+              type: integer
+              example: 1
+            pontos:
+              type: number
+              example: 437
+            vitorias:
+              type: integer
+              example: 9
+            equipe:
+              $ref: '#/components/schemas/EquipeResumo'
+        ultimos_resultados:
+          type: array
+          description: Ate 5 resultados mais recentes da temporada, do mais novo para o mais antigo
+          maxItems: 5
+          items:
+            type: object
+            required: [rodada, corrida, data, grid, pontos, status]
+            properties:
+              rodada:
+                type: integer
+                example: 24
+              corrida:
+                type: string
+                example: Abu Dhabi Grand Prix
+              data:
+                type: string
+                format: date
+                example: '2024-12-08'
+              posicao:
+                type: integer
+                nullable: true
+                example: 6
+              grid:
+                type: integer
+                example: 5
+              pontos:
+                type: number
+                example: 8
+              status:
+                type: string
+                example: Finished
+
+    FavoritoCriacao:
+      type: object
+      required: [piloto_id]
+      properties:
+        piloto_id:
+          type: string
+          pattern: '^[a-z0-9_]+$'
+          minLength: 2
+          maxLength: 60
+          example: leclerc
+
+    Favorito:
+      type: object
+      required: [id, piloto, criado_em]
+      properties:
+        id:
+          type: integer
+          example: 7
+        piloto:
+          $ref: '#/components/schemas/PilotoResumo'
+        criado_em:
+          type: string
+          format: date-time
+          example: '2026-09-25T14:57:00Z'
+
+    ListaFavoritos:
+      type: object
+      required: [dados]
+      properties:
+        dados:
+          type: array
+          items:
+            $ref: '#/components/schemas/Favorito'
+
+    CacheLimpo:
+      type: object
+      required: [entradas_removidas]
+      properties:
+        entradas_removidas:
+          type: integer
+          example: 12
